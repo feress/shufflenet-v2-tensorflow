@@ -15,24 +15,22 @@ python train.py
 Parameters below is for training 0.5x version.
 """
 
-# 1281144/128 = 10008.9375
-# so 1 epoch ~ 10000 steps
 
 GPU_TO_USE = '0'
-BATCH_SIZE = 128
-VALIDATION_BATCH_SIZE = 512
+BATCH_SIZE = 24
+VALIDATION_BATCH_SIZE = 10
 NUM_EPOCHS = 133  # set 166 for 1.0x version
-TRAIN_DATASET_SIZE = 1281144
+TRAIN_DATASET_SIZE = 13607
 NUM_STEPS = NUM_EPOCHS * (TRAIN_DATASET_SIZE // BATCH_SIZE)
 PARAMS = {
-    'train_dataset_path': '/mnt/datasets/imagenet/train_shards/',
-    'val_dataset_path': '/mnt/datasets/imagenet/val_shards/',
+    'train_dataset_path': 'data/tfrecords/train',
+    'val_dataset_path': 'data/tfrecords/val',
     'weight_decay': 4e-5,
     'initial_learning_rate': 0.0625,  # 0.5/8
     'decay_steps': NUM_STEPS,
     'end_learning_rate': 1e-6,
-    'model_dir': 'models/run00/',
-    'num_classes': 1000,
+    'model_dir': 'model/',
+    'num_classes': 8,
     'depth_multiplier': '0.5'  # set '1.0' for 1.0x version
 }
 
@@ -41,7 +39,7 @@ def get_input_fn(is_training):
 
     dataset_path = PARAMS['train_dataset_path'] if is_training else PARAMS['val_dataset_path']
     filenames = os.listdir(dataset_path)
-    filenames = [n for n in filenames if n.endswith('.tfrecords')]
+    filenames = [n for n in filenames if n.startswith('kitti_')]
     filenames = [os.path.join(dataset_path, n) for n in sorted(filenames)]
 
     batch_size = BATCH_SIZE if is_training else VALIDATION_BATCH_SIZE

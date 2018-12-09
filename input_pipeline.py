@@ -82,7 +82,7 @@ class Pipeline:
 
             image = self.augmentation(image_as_string, boxes)
         else:
-            image = tf.image.decode_jpeg(image_as_string, channels=3)
+            image = tf.image.decode_png(image_as_string, channels=3)
             image = (1.0 / 255.0) * tf.to_float(image)  # to [0, 1] range
             image = resize_keeping_aspect_ratio(image, MIN_DIMENSION)
             image = central_crop(image, crop_height=IMAGE_SIZE, crop_width=IMAGE_SIZE)
@@ -105,7 +105,7 @@ class Pipeline:
         )
 
         image = (1.0 / 255.0) * tf.to_float(image)  # to [0, 1] range
-        image = random_color_manipulations(image, probability=0.25, grayscale_probability=0.05)
+        # image = random_color_manipulations(image, probability=0.25, grayscale_probability=0.05)
         return image
 
 
@@ -133,9 +133,9 @@ def resize_keeping_aspect_ratio(image, min_dimension):
 
 
 def get_random_crop(image_as_string, boxes):
-
+    image = tf.image.decode_png(image_as_string, channels=3)
     distorted_bounding_box = tf.image.sample_distorted_bounding_box(
-        tf.image.extract_jpeg_shape(image_as_string),
+        tf.shape(image),
         bounding_boxes=tf.expand_dims(boxes, axis=0),
         min_object_covered=0.25,
         aspect_ratio_range=[0.75, 1.33],
@@ -144,13 +144,10 @@ def get_random_crop(image_as_string, boxes):
         use_image_if_no_bounding_boxes=True
     )
     begin, size, _ = distorted_bounding_box
-    offset_y, offset_x, _ = tf.unstack(begin)
+    offset_height, offset_width, _ = tf.unstack(begin)
     target_height, target_width, _ = tf.unstack(size)
-    crop_window = tf.stack([offset_y, offset_x, target_height, target_width])
 
-    crop = tf.image.decode_and_crop_jpeg(
-        image_as_string, crop_window, channels=3
-    )
+    crop = tf.image.crop_to_bounding_box(image, offset_height, offset_width, target_height, target_width)
     return crop
 
 

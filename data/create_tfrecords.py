@@ -1,182 +1,125 @@
-import io
-import os
-from PIL import Image
-import tensorflow as tf
-import json
-import numpy as np
-import shutil
-import pandas as pd
+import glob
 import math
-import argparse
-from tqdm import tqdm
+import os
+import shutil
 
+import contextlib2
+import tensorflow as tf
+from object_detection.dataset_tools import tf_record_creation_util
+from object_detection.utils import dataset_util
 
 """
-The purpose of this script is to create a set of .tfrecords files
-using a table that contains paths to images and their labels.
+The purpose of this script is to create a set of .tfrecords files using
+- a folder images/ that contains all images for training and validation in 224x224
+- a folder containing corresponding label files for each image
 
 Example of use:
-python create_tfrecords.py \
-    --metadata_file=training.csv \
-    --output=/mnt/datasets/imagenet/train_shards/ \
-    --labels=integer_encoding.json \
-    --boxes=boxes.npy \
-    --num_shards=1000
+python create_tfrecords.py 
 """
 
 
-def make_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-m', '--metadata_file', type=str)
-    parser.add_argument('-o', '--output', type=str)
-    parser.add_argument('-l', '--labels', type=str)
-    parser.add_argument('-b', '--boxes', type=str, default='')
-    parser.add_argument('-s', '--num_shards', type=int, default=1)
-    return parser.parse_args()
-
-
-def dict_to_tf_example(image_path, integer_label, boxes=None):
+def dict_to_tf_example(image_path, integer_label, box):
     """
-    Arguments:
-        image_path: a string.
-        integer_label: an integer.
-        boxes: a numpy float array with shape [num_boxes, 4] or None,
-            boxes are in normalized coordinates.
     Returns:
         an instance of tf.Example or None.
     """
-    assert image_path.endswith('.JPEG')
-    with tf.gfile.GFile(image_path, 'rb') as f:
-        encoded_jpg = f.read()
-
-    # check image format
-    encoded_jpg_io = io.BytesIO(encoded_jpg)
-    image = Image.open(encoded_jpg_io)
-    if image.mode == 'L':  # if grayscale
-        rgb_image = np.stack(3*[np.array(image)], axis=2)
-        encoded_jpg = to_jpeg_bytes(rgb_image)
-        encoded_jpg_io = io.BytesIO(encoded_jpg)
-        image = Image.open(encoded_jpg_io)
-    elif image.mode != 'RGB':
-        return None
-    if image.format != 'JPEG':
-        return None
-    assert image.mode == 'RGB'
-
-    assert image.size[0] > 1 and image.size[1] > 1
-    assert (0 <= integer_label) and (integer_label <= 999)
+    with tf.gfile.GFile(image_path, 'rb') as fid:
+        encoded_image_data = fid.read()
 
     feature = {
-        'image': _bytes_feature(encoded_jpg),
-        'label': _int64_feature(integer_label)
+        'image': dataset_util.bytes_feature(encoded_image_data),
+        'label': dataset_util.int64_feature(integer_label)
     }
 
-    if boxes is not None:
-        xmin_list, ymin_list, xmax_list, ymax_list = [], [], [], []
-        for box in boxes:
+    xmin_list, ymin_list, xmax_list, ymax_list = [], [], [], []
+    xmin, ymin, xmax, ymax = box
 
-            xmin, ymin, xmax, ymax = box
+    if (xmin > xmax) or (ymin > ymax) or (xmin > 1.0) or (xmin < 0.0) or (xmax > 1.0) or (xmax < 0.0) \
+            or (ymin > 1.0) or (ymin < 0.0)or (ymax > 1.0) or (ymax < 0.0):
+        print("Invalid %s " % image_path)
+        return None
 
-            assert (xmin < xmax) and (ymin < ymax)
-            assert (xmin <= 1.0) and (xmin >= 0.0)
-            assert (xmax <= 1.0) and (xmax >= 0.0)
-            assert (ymin <= 1.0) and (ymin >= 0.0)
-            assert (ymax <= 1.0) and (ymax >= 0.0)
+    xmin_list.append(xmin)
+    ymin_list.append(ymin)
+    xmax_list.append(xmax)
+    ymax_list.append(ymax)
 
-            xmin_list.append(xmin)
-            ymin_list.append(ymin)
-            xmax_list.append(xmax)
-            ymax_list.append(ymax)
-
-        feature.update({
-            'xmin': _float_list_feature(xmin_list),
-            'ymin': _float_list_feature(ymin_list),
-            'xmax': _float_list_feature(xmax_list),
-            'ymax': _float_list_feature(ymax_list)
-        })
+    feature.update({
+        'xmin': dataset_util.float_list_feature(xmin_list),
+        'ymin': dataset_util.float_list_feature(ymin_list),
+        'xmax': dataset_util.float_list_feature(xmax_list),
+        'ymax': dataset_util.float_list_feature(ymax_list)
+    })
 
     example = tf.train.Example(features=tf.train.Features(feature=feature))
     return example
 
 
-def _bytes_feature(value):
-    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
-
-
-def _float_list_feature(value):
-    return tf.train.Feature(float_list=tf.train.FloatList(value=value))
-
-
-def _int64_feature(value):
-    return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
-
-
-def to_jpeg_bytes(array):
-    image = Image.fromarray(array)
-    tmp = io.BytesIO()
-    image.save(tmp, format='jpeg')
-    return tmp.getvalue()
+def read_boxes(label_filename, class_name):
+    """
+    Returns all boxes from a label file with the given class.
+    """
+    boxes = []
+    try:
+        with open(label_filename, "r") as label_file:
+            for line in label_file.readlines():
+                if line.startswith(class_name):
+                    labels = line.strip().split()
+                    boxes.append([float(labels[1]), float(labels[2]), float(labels[3]), float(labels[4])])
+    except IOError:
+        print("Cannot find %s.txt" % label_filename)
+    return boxes
 
 
 def main():
-    ARGS = make_args()
+    """
+    Write Examples to tfrecord files with a single object/bbox per Example.
+    Not super efficient, but does the job and only has to be done once before starting the training.
+    """
+    NUM_VAL_IMAGES = 500  # number of images for validation
+    NUM_SHARDS = 10
+    OUTPUT_DIR_TRAIN = "tfrecords/train/"
+    OUTPUT_DIR_VAL = "tfrecords/val/"
 
-    with open(ARGS.labels, 'r') as f:
-        label_encoder = json.load(f)
-    assert len(label_encoder) > 0
-    print('Number of classes:', len(label_encoder))
+    shutil.rmtree("tfrecords/", ignore_errors=True)
+    os.makedirs(OUTPUT_DIR_TRAIN)
+    os.makedirs(OUTPUT_DIR_VAL)
 
-    metadata = pd.read_csv(ARGS.metadata_file)
-    metadata = metadata.sample(frac=1)  # shuffle images
-    print('Number of images:', len(metadata))
-
-    num_shards = ARGS.num_shards
-    num_examples = len(metadata)
-    shard_size = math.ceil(num_examples/num_shards)
-    print('Number of images per shard:', shard_size)
-
-    bounding_boxes = None
-    if len(ARGS.boxes) > 0:
-        bounding_boxes = np.load(ARGS.boxes)[()]
-        print('Number of images with boxes:', len(bounding_boxes))
-
-    output_dir = ARGS.output
-    shutil.rmtree(output_dir, ignore_errors=True)
-    os.mkdir(output_dir)
-
-    shard_id = 0
     num_examples_written = 0
-    num_skipped_images = 0
-    for T in tqdm(metadata.itertuples()):
 
-        if num_examples_written == 0:
-            shard_path = os.path.join(output_dir, 'shard-%04d.tfrecords' % shard_id)
-            writer = tf.python_io.TFRecordWriter(shard_path)
+    kitti_classes = ["car", "van", "truck", "pedestrian", "person_sitting", "cyclist", "tram", "misc"]
 
-        image_path = T.path  # absolute path to an image
-        integer_label = label_encoder[T.wordnet_id]
-        boxes = None  # validation images don't have boxes
-        if bounding_boxes is not None:
-            boxes = bounding_boxes.get(T.just_name, np.empty((0, 4), dtype='float32'))
+    label_files = glob.glob("%s*.txt" % "labels/")
 
-        tf_example = dict_to_tf_example(image_path, integer_label, boxes)
-        if tf_example is None:
-            num_skipped_images += 1
-            continue
-        writer.write(tf_example.SerializeToString())
-        num_examples_written += 1
+    # TFRecord set for validation (not sharded as only 500 images)
+    val_writer = tf.python_io.TFRecordWriter('%skitti_val.tfrecord' % OUTPUT_DIR_VAL)
 
-        if num_examples_written == shard_size:
-            shard_id += 1
-            num_examples_written = 0
-            writer.close()
+    train_dataset_name = '%skitti_train.tfrecord' % OUTPUT_DIR_TRAIN
 
-    # this happens if num_examples % num_shards != 0
-    if num_examples_written != 0:
-        writer.close()
+    with contextlib2.ExitStack() as tf_record_close_stack:
+        sharded_train_output = tf_record_creation_util.open_sharded_output_tfrecords(
+            tf_record_close_stack, train_dataset_name, NUM_SHARDS)
 
-    print('Number of skipped images:', num_skipped_images)
-    print('Result is here:', ARGS.output)
+        for kitti_class in kitti_classes:
+
+            for label_file in label_files:
+                label_name = os.path.basename(label_file).split(".")[0]
+                boxes = read_boxes(label_file, kitti_class)
+                image_path = ("images/%s.png " % label_name)
+                integer_label = kitti_classes.index(kitti_class)
+
+                for box in boxes:
+                    tf_example = dict_to_tf_example(image_path, integer_label, box)
+
+                    if int(label_name) < NUM_VAL_IMAGES:
+                        val_writer.write(tf_example.SerializeToString())
+                    else:
+                        output_shard_index = num_examples_written % NUM_SHARDS
+                        sharded_train_output[output_shard_index].write(tf_example.SerializeToString())
+                        num_examples_written += 1
+
+    val_writer.close()
 
 
-main()
+if __name__ == "__main__":
+    main()
